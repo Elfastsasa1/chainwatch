@@ -1167,7 +1167,7 @@ export default function App() {
         </div>
 
         {/* Main — data passed as props, no double fetch */}
-        <div style={{ overflow: "auto", background: "var(--bg-void)" }}>
+        <div style={{ overflow: "auto", background: "var(--bg-void)", minHeight: "100%" }}>
           <Dashboard token={active} data={activeData} loading={activeLoading} />
         </div>
       </div>
