@@ -1137,7 +1137,7 @@ export default function App() {
 
       <AlertTicker tokens={tokens} tokenDatas={tokenDatasArr} />
 
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "220px 1fr", minHeight: "calc(100vh - 70px)" }}>
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "220px 1fr", minHeight: "calc(100vh - 70px)", height: "calc(100vh - 70px)" }}>
         {/* Sidebar */}
         <div style={{ borderRight: "1px solid var(--border)", background: "var(--bg-deep)", padding: "10px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
           <Watchlist tokens={tokens} active={active} onSelect={setActive}
