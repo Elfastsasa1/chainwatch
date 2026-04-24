@@ -50,7 +50,7 @@ const DEFAULT_TOKENS = [
 ];
 
 const DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex";
-
+const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 // ============================================================
 // MATH UTILITIES
 // ============================================================
@@ -323,33 +323,101 @@ function useTokenData(address) {
     if (!address) return;
     setLoading(true);
     const controller = new AbortController();
+
     try {
-      const res = await fetch(`${DEXSCREENER_BASE}/tokens/${address}`, { signal: controller.signal });
-      if (res.ok) {
-        const json = await res.json();
-        const pair = json.pairs?.[0];
-        if (pair) {
-          const ohlcv = MathUtils.generateMockOHLCV(180, parseFloat(pair.priceUsd || 1));
-          setData({ pair, ohlcv, source: "dexscreener" });
-          setLoading(false);
-          return;
-        }
+      // STEP 1: Ambil pair info dari DexScreener
+      const dsRes = await fetch(
+        `${DEXSCREENER_BASE}/tokens/${address}`,
+        { signal: controller.signal }
+      );
+      const dsJson = await dsRes.json();
+      const pair = dsJson.pairs?.[0];
+
+      if (!pair) throw new Error("no_pair");
+
+      // STEP 2: Ambil OHLCV dari GeckoTerminal
+      // Butuh network + pool address dari pair DexScreener
+      const network = pair.chainId || "eth";
+      const poolAddress = pair.pairAddress;
+
+      // Map chainId DexScreener ke network GeckoTerminal
+      const networkMap = {
+        "ethereum": "eth",
+        "bsc": "bsc",
+        "polygon": "polygon_pos",
+        "arbitrum": "arbitrum",
+        "base": "base",
+        "solana": "solana",
+        "avalanche": "avax",
+        "optimism": "optimism",
+      };
+      const geckoNetwork = networkMap[network] || network;
+
+      const ohlcvRes = await fetch(
+        `${GECKO_BASE}/networks/${geckoNetwork}/pools/${poolAddress}/ohlcv/day?limit=180&currency=usd`,
+        { signal: controller.signal }
+      );
+      const ohlcvJson = await ohlcvRes.json();
+      const rawOhlcv = ohlcvJson?.data?.attributes?.ohlcv_list;
+
+      let ohlcv;
+      if (rawOhlcv && rawOhlcv.length > 10) {
+        // Format GeckoTerminal: [timestamp, open, high, low, close, volume]
+        ohlcv = rawOhlcv
+          .map(([t, o, h, l, c, v]) => ({
+            time: t,
+            open: parseFloat(o),
+            high: parseFloat(h),
+            low: parseFloat(l),
+            close: parseFloat(c),
+            volume: parseFloat(v),
+          }))
+          .filter(c => c.close > 0)
+          .sort((a, b) => a.time - b.time);
+      } else {
+        // Fallback mock kalau GeckoTerminal tidak ada data pool ini
+        ohlcv = MathUtils.generateMockOHLCV(
+          180,
+          parseFloat(pair.priceUsd || 1)
+        );
       }
+
+      setData({
+        pair,
+        ohlcv,
+        source: rawOhlcv?.length > 10 ? "live" : "mock",
+      });
+
     } catch (e) {
-      if (e.name === "AbortError") return; // silently ignore aborted requests
+      if (e.name === "AbortError") return;
+
+      // Full fallback: mock data
+      const ohlcv = MathUtils.generateMockOHLCV(
+        180,
+        Math.random() * 10 + 0.1
+      );
+      setData({
+        pair: {
+          baseToken: {
+            symbol: address.slice(2, 7).toUpperCase(),
+            name: "Custom Token"
+          },
+          priceUsd: ohlcv[ohlcv.length - 1].close.toString(),
+          volume: { h24: ohlcv.slice(-24).reduce((a, c) => a + c.volume, 0) },
+          liquidity: { usd: Math.random() * 1e6 + 1e4 },
+          txns: {
+            h24: {
+              buys: Math.floor(Math.random() * 500 + 50),
+              sells: Math.floor(Math.random() * 500 + 50)
+            }
+          },
+          priceChange: { h24: (Math.random() - 0.5) * 20 },
+        },
+        ohlcv,
+        source: "mock",
+      });
     }
-    const ohlcv = MathUtils.generateMockOHLCV(180, Math.random() * 10 + 0.1);
-    setData({
-      pair: {
-        baseToken: { symbol: address.slice(2, 7).toUpperCase(), name: "Custom Token" },
-        priceUsd: ohlcv[ohlcv.length - 1].close.toString(),
-        volume: { h24: ohlcv.slice(-24).reduce((a, c) => a + c.volume, 0) },
-        liquidity: { usd: Math.random() * 1e6 + 1e4 },
-        txns: { h24: { buys: Math.floor(Math.random() * 500 + 50), sells: Math.floor(Math.random() * 500 + 50) } },
-        priceChange: { h24: (Math.random() - 0.5) * 20 },
-      },
-      ohlcv, source: "mock",
-    });
+
     setLoading(false);
     return () => controller.abort();
   }, [address]);
@@ -359,6 +427,7 @@ function useTokenData(address) {
     const t = setInterval(fetch_, 60000);
     return () => clearInterval(t);
   }, [fetch_]);
+
   return { data, loading, refetch: fetch_ };
 }
 
@@ -662,7 +731,9 @@ function Dashboard({ token, data, loading }) {
         <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
           <span style={{ fontSize: "20px", color: "var(--neon)", fontWeight: 800, letterSpacing: "3px", textShadow: "0 0 15px var(--neon-glow)" }}>{pair?.baseToken?.symbol || token.symbol}</span>
           <span style={{ fontSize: "9px", color: "var(--text-muted)", letterSpacing: "2px" }}>{pair?.baseToken?.name || token.name}</span>
-          {data?.source === "mock" && <StatusBadge label="SIM" color="var(--amber)" />}
+          {data?.source === "mock" && <StatusBadge label="SIM" color="var(--amber)" />}           
+          {data?.source === "live" && <StatusBadge label="LIVE DATA" color="var(--neon)" />}
+          {data?.source === "dexscreener" && <StatusBadge label="DS ONLY" color="var(--blue)" />}
         </div>
         <div style={{ display: "flex", gap: "16px", alignItems: "center", flexWrap: "wrap" }}>
           {[
