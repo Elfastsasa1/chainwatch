@@ -847,7 +847,7 @@ const DataFetcher = {
 
     // OHLC endpoint — return data OHLC asli, bukan fake
     const res = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=180`
+      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`
     );
     const json = await res.json();
     if(!Array.isArray(json)||json.length<10) return null;
@@ -861,7 +861,7 @@ const DataFetcher = {
 
     // Fetch volume terpisah
     const volRes = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=180&interval=daily`
+      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=365&interval=daily`
     );
     const volJson = await volRes.json();
     if(volJson.total_volumes) {
