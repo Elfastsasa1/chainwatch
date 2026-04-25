@@ -94,45 +94,50 @@ const MFDFA = {
 
   // Step 2: Cumulative sum (profile)
   profile(returns) {
-    const mean = returns.reduce((a,b)=>a+b,0)/returns.length;
+    if(!returns||returns.length===0) return [];
+    const clean = returns.filter(r=>isFinite(r));
+    if(clean.length===0) return [];
+    const mean = clean.reduce((a,b)=>a+b,0)/clean.length;
     const X = [];
     let cum = 0;
-    for (const r of returns) { cum += (r - mean); X.push(cum); }
+    for (const r of clean) {
+      cum += (r - mean);
+      X.push(isFinite(cum)?cum:0);
+    }
     return X;
   },
 
   // Step 3: Polynomial detrending (degree m) on segment
-  polyDetrend(segment, degree=2) {
+  polyDetrend(segment, degree=1) {
     const n = segment.length;
-    if (n <= degree) return segment.map(()=>0);
-    // Build Vandermonde matrix
-    const A = [];
-    for (let i = 0; i < n; i++) {
-      const row = [];
-      for (let d = 0; d <= degree; d++) row.push(Math.pow(i/(n-1), d));
-      A.push(row);
-    }
-    // Least squares via normal equations (small matrix, ok)
-    const At = A[0].map((_,c)=>A.map(r=>r[c]));
-    const AtA = At.map(r=>At[0].map((_,j)=>r.reduce((s,_,k)=>s+r[k]*At[k][j],0)));
-    // Simplified: use linear fit for speed
-    const xi = Array.from({length:n},(_,i)=>i);
-    const mx = xi.reduce((a,b)=>a+b,0)/n;
-    const my = segment.reduce((a,b)=>a+b,0)/n;
-    const num = xi.reduce((s,x,i)=>s+(x-mx)*(segment[i]-my),0);
-    const den = xi.reduce((s,x)=>s+(x-mx)**2,0);
-    const b1 = den===0?0:num/den;
-    const b0 = my - b1*mx;
-    // Residuals
-    return segment.map((y,i)=>y-(b0+b1*i));
+    if (n < 3) return segment.map(()=>0);
+    try {
+      const xi = Array.from({length:n},(_,i)=>i);
+      const mx = xi.reduce((a,b)=>a+b,0)/n;
+      const my = segment.reduce((a,b)=>a+b,0)/n;
+      if(!isFinite(mx)||!isFinite(my)) return segment.map(()=>0);
+      const num = xi.reduce((s,x,i)=>s+(x-mx)*(segment[i]-my),0);
+      const den = xi.reduce((s,x)=>s+(x-mx)**2,0);
+      if(den===0||!isFinite(den)) return segment.map(()=>0);
+      const b1 = num/den;
+      const b0 = my - b1*mx;
+      return segment.map((y,i)=>{
+        const res = y-(b0+b1*i);
+        return isFinite(res)?res:0;
+      });
+    } catch { return segment.map(()=>0); }
   },
 
   // Step 4: Compute F²(v,s) for one segment
   segVariance(X, start, s, degree=1) {
+    if(!X||start<0||s<4||start+s>X.length) return 0;
     const seg = X.slice(start, start+s);
-    if (seg.length < 3) return 0;
-    const res = this.polyDetrend(seg, degree);
-    return res.reduce((a,b)=>a+b*b,0)/res.length;
+    if(seg.length<4||seg.some(v=>!isFinite(v))) return 0;
+    try {
+      const res = this.polyDetrend(seg, degree);
+      const vr = res.reduce((a,b)=>a+b*b,0)/res.length;
+      return isFinite(vr)&&vr>=0?vr:0;
+    } catch { return 0; }
   },
 
   // Step 5: Fq(s) for given scale s and moment q
@@ -141,20 +146,27 @@ const MFDFA = {
     const Ns = Math.floor(n/s);
     if (Ns < 4) return null;
     const variances = [];
-    // Forward
-    for (let v = 0; v < Ns; v++) variances.push(this.segVariance(X, v*s, s, degree));
-    // Backward
-    for (let v = 0; v < Ns; v++) variances.push(this.segVariance(X, n-((v+1)*s), s, degree));
-    const validV = variances.filter(v=>v>0);
-    if (validV.length === 0) return null;
-    if (Math.abs(q) < 0.001) {
-      // q=0: geometric mean
-      const logMean = validV.reduce((a,v)=>a+Math.log(v),0)/validV.length;
-      return Math.exp(logMean/2);
+    for (let v = 0; v < Ns; v++) {
+      const vr = this.segVariance(X, v*s, s, degree);
+      if(vr > 0 && isFinite(vr)) variances.push(vr);
     }
-    const moments = validV.map(v=>Math.pow(v, q/2));
+    for (let v = 0; v < Ns; v++) {
+      const start = n - ((v+1)*s);
+      if(start < 0) continue;
+      const vr = this.segVariance(X, start, s, degree);
+      if(vr > 0 && isFinite(vr)) variances.push(vr);
+    }
+    if (variances.length === 0) return null;
+    if (Math.abs(q) < 0.001) {
+      const logMean = variances.reduce((a,v)=>a+Math.log(v),0)/variances.length;
+      return isFinite(logMean) ? Math.exp(logMean/2) : null;
+    }
+    const moments = variances.map(v=>Math.pow(v, q/2)).filter(m=>isFinite(m)&&m>0);
+    if(moments.length === 0) return null;
     const mean = moments.reduce((a,b)=>a+b,0)/moments.length;
-    return Math.pow(Math.max(mean,1e-20), 1/q);
+    if(!isFinite(mean) || mean <= 0) return null;
+    const result = Math.pow(mean, 1/q);
+    return isFinite(result) ? result : null;
   },
 
   // Step 6: h(q) via log-log regression of Fq(s) vs s
@@ -172,15 +184,18 @@ const MFDFA = {
       const logS=[], logF=[];
       for (const s of scales) {
         const f = this.Fq(X, s, q, degree);
-        if (f && f > 0) { logS.push(Math.log(s)); logF.push(Math.log(f)); }
+        if (f && f > 0 && isFinite(f)) {
+          const ls = Math.log(s), lf = Math.log(f);
+          if(isFinite(ls) && isFinite(lf)) { logS.push(ls); logF.push(lf); }
+        }
       }
       if (logS.length < 3) return {q,h:0.5,valid:false};
-      // Linear regression slope = h(q)
       const mx=logS.reduce((a,b)=>a+b,0)/logS.length;
       const my=logF.reduce((a,b)=>a+b,0)/logF.length;
       const num=logS.reduce((s,x,i)=>s+(x-mx)*(logF[i]-my),0);
       const den=logS.reduce((s,x)=>s+(x-mx)**2,0);
       const h = den===0?0.5:num/den;
+      if(!isFinite(h)) return {q,h:0.5,valid:false};
       return {q, h:Math.max(0.05,Math.min(1.2,h)), valid:true};
     });
   },
@@ -196,12 +211,16 @@ const MFDFA = {
     const result = [];
     for (let i = 1; i < n-1; i++) {
       const {q,h} = hqArr[i];
-      // alpha = d(tau)/dq ≈ h(q) + q * dh/dq
-      const dh = (hqArr[i+1].h - hqArr[i-1].h) / (hqArr[i+1].q - hqArr[i-1].q);
+      const qNext = hqArr[i+1].q, qPrev = hqArr[i-1].q;
+      const dq = qNext - qPrev;
+      if(dq === 0) continue;
+      const dh = (hqArr[i+1].h - hqArr[i-1].h) / dq;
+      if(!isFinite(dh)) continue;
       const alpha = h + q*dh;
       const tauVal = q*h - 1;
       const f = q*alpha - tauVal;
-      result.push({q, alpha:Math.max(0,alpha), f:Math.max(0,Math.min(2,f))});
+      if(!isFinite(alpha)||!isFinite(f)||alpha<0) continue;
+      result.push({q, alpha, f:Math.max(0,Math.min(2,f))});
     }
     return result;
   },
@@ -227,12 +246,16 @@ const MFDFA = {
     if (prices.length < winSize*2) return [];
     const signals = [];
     for (let i=winSize; i<prices.length; i+=5) {
-      const slice = prices.slice(i-winSize, i);
-      const ret = this.logReturns(slice);
-      const hqArr = this.hq(ret, [0,2], 1);
-      const H = hqArr.find(d=>Math.abs(d.q-2)<0.1)?.h ?? 0.5;
-      if (H < 0.35) signals.push({i, H, type:"ANTI_PERSISTENT", label:"BREAKDOWN"});
-      else if (H > 0.72) signals.push({i, H, type:"PERSISTENT", label:"TRENDING"});
+      try {
+        const slice = prices.slice(i-winSize, i);
+        const ret = this.logReturns(slice).filter(r=>isFinite(r));
+        if(ret.length < 20) continue;
+        const hqArr = this.hq(ret, [2], 1);
+        const H = hqArr[0]?.h ?? 0.5;
+        if(!isFinite(H)) continue;
+        if (H < 0.35) signals.push({i, H, type:"ANTI_PERSISTENT", label:"BREAKDOWN"});
+        else if (H > 0.72) signals.push({i, H, type:"PERSISTENT", label:"TRENDING"});
+      } catch { continue; }
     }
     return signals;
   },
@@ -326,7 +349,7 @@ const SignalEngine = {
   // Confluence scoring
   score(ohlcv, hqArr) {
     if(ohlcv.length<50) return {score:0,signals:[],grade:"SCANNING",entry:null};
-    const H = MFDFA.hurst(hqArr);
+    const H = isFinite(MFDFA.hurst(hqArr)) ? MFDFA.hurst(hqArr) : 0.5;
     const vol = Structure.volRegime(ohlcv);
     const struct = Structure.swings(ohlcv);
     const beh = Structure.behavior(ohlcv);
@@ -384,9 +407,9 @@ const Backtest = {
     const ec=[equity];
     for(let i=50;i<data.length-1;i++){
       const sl=data.slice(Math.max(0,i-60),i+1);
-      const ret=MFDFA.logReturns(sl.map(c=>c.close));
-      // Fast hq approximation for backtest (just q=2)
-      const hqArr=MFDFA.hq(ret,[0,2],1);
+      const ret=MFDFA.logReturns(sl.map(c=>c.close)).filter(r=>isFinite(r));
+      if(ret.length<20){ec.push(equity);continue;}
+      const hqArr=MFDFA.hq(ret,[2],1);
       const sc=SignalEngine.score(sl,hqArr);
       // Quarantine check
       const H=sc.H;
@@ -569,21 +592,28 @@ function useAssetData(asset, tf) {
 function useMFDFA(ohlcv) {
   return useMemo(()=>{
     if(!ohlcv||ohlcv.length<60) return null;
-    const prices=ohlcv.map(c=>c.close);
-    const returns=MFDFA.logReturns(prices);
-    const hqArr=MFDFA.hq(returns,[-3,-2,-1,-0.5,0,0.5,1,2,3],1);
-    const fAlphaArr=MFDFA.fAlpha(hqArr);
-    const H=MFDFA.hurst(hqArr);
-    const fd=MFDFA.fractalDim(H);
-    const width=MFDFA.multifractalWidth(fAlphaArr);
-    const breakdown=MFDFA.detectBreakdown(prices);
-    const struct=Structure.swings(ohlcv);
-    const vol=Structure.volRegime(ohlcv);
-    const beh=Structure.behavior(ohlcv);
-    const liq=Structure.liquidity(ohlcv);
-    const scoreData=SignalEngine.score(ohlcv,hqArr);
-    const bt=Backtest.run(ohlcv);
-    return {hqArr,fAlpha:fAlphaArr,fAlphaArr,H,fd,width,breakdown,struct,vol,beh,liq,scoreData,bt,returns};
+    try {
+      const prices=ohlcv.map(c=>c.close).filter(p=>p>0&&isFinite(p));
+      if(prices.length<60) return null;
+      const returns=MFDFA.logReturns(prices).filter(r=>isFinite(r));
+      if(returns.length<30) return null;
+      const hqArr=MFDFA.hq(returns,[-3,-2,-1,-0.5,0,0.5,1,2,3],1);
+      const fAlphaArr=MFDFA.fAlpha(hqArr).filter(d=>isFinite(d.alpha)&&isFinite(d.f));
+      const H=Math.max(0.05,Math.min(1.2,MFDFA.hurst(hqArr)));
+      const fd=MFDFA.fractalDim(H);
+      const width=MFDFA.multifractalWidth(fAlphaArr);
+      const breakdown=MFDFA.detectBreakdown(prices);
+      const struct=Structure.swings(ohlcv);
+      const vol=Structure.volRegime(ohlcv);
+      const beh=Structure.behavior(ohlcv);
+      const liq=Structure.liquidity(ohlcv);
+      const scoreData=SignalEngine.score(ohlcv,hqArr);
+      const bt=Backtest.run(ohlcv);
+      return {hqArr,fAlpha:fAlphaArr,fAlphaArr,H,fd,width,breakdown,struct,vol,beh,liq,scoreData,bt,returns};
+    } catch(e) {
+      console.warn("MF-DFA error:", e.message);
+      return null;
+    }
   },[ohlcv]);
 }
 
