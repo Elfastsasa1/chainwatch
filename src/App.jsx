@@ -3,7 +3,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 // ============================================================
 // CONFIG
 // ============================================================
-const TWELVE_API_KEY = "YOUR_TWELVEDATA_KEY_HERE";
+const TWELVE_API_KEY = "ea45542dc91f43eb9eb2ce2e83d518da";
 const DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex";
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const TWELVE_BASE = "https://api.twelvedata.com";
@@ -522,7 +522,7 @@ const DataFetcher = {
   },
 
   async fetchTwelve(symbol, type, tf=TIMEFRAMES[3]) {
-    const noKey=!TWELVE_API_KEY||TWELVE_API_KEY==="YOUR_TWELVEDATA_KEY_HERE";
+    const noKey=!TWELVE_API_KEY||TWELVE_API_KEY==="ea45542dc91f43eb9eb2ce2e83d518da";
     const base=type==="forex"?(0.9+Math.random()*0.5):type==="stock"?(50+Math.random()*300):(100+Math.random()*50000);
     if(noKey){
       const ohlcv=mockOHLCV(tf.bars,base);
