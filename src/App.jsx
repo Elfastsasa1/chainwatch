@@ -520,6 +520,7 @@ const DataFetcher = {
     if(!ohlcv) ohlcv=mockOHLCV(tf.bars,parseFloat(pair.priceUsd||1));
     return {pair,ohlcv,source,meta:{symbol:pair.baseToken?.symbol,name:pair.baseToken?.name,type:"evm",price:parseFloat(pair.priceUsd||0),change24h:pair.priceChange?.h24||0,volume24h:pair.volume?.h24||0,liquidity:pair.liquidity?.usd||0,txns:pair.txns?.h24}};
   },
+
   async fetchCryptoPrice(symbol) {
   try {
     const coinMap = {
@@ -528,21 +529,47 @@ const DataFetcher = {
     };
     const coinId = coinMap[symbol];
     if(!coinId) return null;
+
+    // OHLC endpoint — return data OHLC asli, bukan fake
     const res = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=180&interval=daily`
+      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=180`
     );
     const json = await res.json();
-    if(!json.prices||json.prices.length<10) return null;
-    const ohlcv = json.prices.map(([t,p],i)=>{
-      const vol = json.total_volumes?.[i]?.[1]||0;
-      return {time:Math.floor(t/1000),open:p,high:p*1.002,low:p*0.998,close:p,volume:vol};
-    });
+    if(!Array.isArray(json)||json.length<10) return null;
+
+    // Format: [timestamp, open, high, low, close]
+    const ohlcv = json.map(([t,o,h,l,c])=>({
+      time: Math.floor(t/1000),
+      open: +o, high: +h, low: +l, close: +c,
+      volume: 0 // OHLC endpoint tidak include volume
+    }));
+
+    // Fetch volume terpisah
+    const volRes = await fetch(
+      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=180&interval=daily`
+    );
+    const volJson = await volRes.json();
+    if(volJson.total_volumes) {
+      volJson.total_volumes.forEach(([t,v],i)=>{
+        if(ohlcv[i]) ohlcv[i].volume = v;
+      });
+    }
+
     const last = ohlcv[ohlcv.length-1];
     const prev = ohlcv[ohlcv.length-2];
     const change24h = prev?((last.close-prev.close)/prev.close)*100:0;
-    return {ohlcv,source:"coingecko",meta:{symbol,name:coinId,type:"crypto12",price:last.close,change24h,volume24h:last.volume,liquidity:0,txns:null}};
+
+    return {
+      ohlcv,
+      source:"coingecko",
+      meta:{
+        symbol, name:coinId, type:"crypto12",
+        price:last.close, change24h,
+        volume24h:last.volume, liquidity:0, txns:null
+      }
+    };
   } catch { return null; }
-  },
+},
   async fetchTwelve(symbol, type, tf=TIMEFRAMES[3]) {
     const noKey=!TWELVE_API_KEY||TWELVE_API_KEY==="ea45542dc91f43eb9eb2ce2e83d518da";
     const base=type==="forex"?(0.9+Math.random()*0.5):type==="stock"?(50+Math.random()*300):(100+Math.random()*50000);
