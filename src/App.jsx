@@ -1758,6 +1758,7 @@ function Dashboard({asset,data,loading}){
           </>
         )}
 
+        {tab==="BEHAVIOR"&&analysis&&(
           <>
             <SignalCard trade={analysis.scoreData.trade} symbol={meta.symbol||asset.symbol}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginTop:"8px"}}>
