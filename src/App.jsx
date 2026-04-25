@@ -396,6 +396,321 @@ const SignalEngine = {
 };
 
 // ============================================================
+// V2.0 — LEVEL 1: CHAOS GATE (PE + Lyapunov)
+// ============================================================
+const ChaosEngine = {
+  LYAPUNOV_BUFFER: 0.03,
+
+  // Permutation Entropy — embedding dim m, delay tau
+  permutationEntropy(prices, m=3, tau=1) {
+    if(!prices||prices.length<m*tau+1) return 1.0;
+    const n=prices.length;
+    const factorial=f=>[1,1,2,6,24,120,720][f]||720;
+    const patternCounts={};
+    let total=0;
+    for(let i=0;i<n-(m-1)*tau;i++){
+      const vec=[];
+      for(let j=0;j<m;j++) vec.push(prices[i+j*tau]);
+      // Get rank permutation
+      const idx=[...Array(m).keys()].sort((a,b)=>vec[a]-vec[b]);
+      const key=idx.join(",");
+      patternCounts[key]=(patternCounts[key]||0)+1;
+      total++;
+    }
+    if(total===0) return 1.0;
+    const maxEntropy=Math.log(factorial(m));
+    if(maxEntropy===0) return 1.0;
+    let H=0;
+    for(const k in patternCounts){
+      const p=patternCounts[k]/total;
+      if(p>0) H-=p*Math.log(p);
+    }
+    const pe=H/maxEntropy;
+    return isFinite(pe)?Math.max(0,Math.min(1,pe)):1.0;
+  },
+
+  // Lyapunov Exponent — Rosenstein simplified
+  lyapunov(prices, embDim=3, delay=1) {
+    if(!prices||prices.length<30) return 0.1;
+    try {
+      const n=prices.length;
+      const Ns=n-(embDim-1)*delay;
+      if(Ns<10) return 0.1;
+      // Reconstruct attractor
+      const states=[];
+      for(let i=0;i<Ns;i++){
+        const s=[];
+        for(let d=0;d<embDim;d++) s.push(prices[i+d*delay]);
+        states.push(s);
+      }
+      // Find nearest neighbors & track divergence
+      const divergences=[];
+      for(let i=0;i<Math.min(Ns-5,50);i++){
+        let minDist=Infinity,minJ=-1;
+        for(let j=0;j<Ns;j++){
+          if(Math.abs(i-j)<5) continue;
+          let dist=0;
+          for(let d=0;d<embDim;d++) dist+=(states[i][d]-states[j][d])**2;
+          dist=Math.sqrt(dist);
+          if(dist>0&&dist<minDist){minDist=dist;minJ=j;}
+        }
+        if(minJ<0||minDist<=0) continue;
+        const steps=Math.min(5,Ns-Math.max(i,minJ)-1);
+        if(steps<1) continue;
+        let distLater=0;
+        for(let d=0;d<embDim;d++) distLater+=(states[i+steps][d]-states[minJ+steps][d])**2;
+        distLater=Math.sqrt(distLater);
+        if(distLater>0&&minDist>0){
+          const lce=Math.log(distLater/minDist)/steps;
+          if(isFinite(lce)) divergences.push(lce);
+        }
+      }
+      if(divergences.length===0) return 0.0;
+      const lambda=divergences.reduce((a,b)=>a+b,0)/divergences.length;
+      return isFinite(lambda)?lambda:0.0;
+    } catch { return 0.0; }
+  },
+
+  // Main chaos assessment
+  assess(ohlcv) {
+    if(!ohlcv||ohlcv.length<30) return {status:"INSUFFICIENT_DATA",pe:1,lambda:0,hardKill:true,softKill:false,chaosMult:0};
+    const prices=ohlcv.slice(-60).map(c=>c.close).filter(p=>p>0&&isFinite(p));
+    if(prices.length<20) return {status:"INSUFFICIENT_DATA",pe:1,lambda:0,hardKill:true,softKill:false,chaosMult:0};
+
+    const pe=this.permutationEntropy(prices,3,1);
+    const lambda=this.lyapunov(prices,3,1);
+
+    let status,hardKill=false,softKill=false;
+    if(pe>0.75&&lambda>this.LYAPUNOV_BUFFER){
+      status="CHAOTIC_NO_TRADE"; hardKill=true;
+    } else if(pe>0.75){
+      status="ELEVATED_CHAOS"; softKill=true;
+    } else {
+      status="STRUCTURED_MARKET";
+    }
+
+    const chaosMult=hardKill?0:softKill?(1-pe):1.0;
+    return {status,pe,lambda,hardKill,softKill,chaosMult};
+  },
+};
+
+// ============================================================
+// V2.0 — LEVEL 2: REGIME DETECTION (HMM simplified)
+// ============================================================
+const RegimeEngine = {
+  // Simplified HMM via Gaussian emission on returns + vol
+  detect(ohlcv) {
+    if(!ohlcv||ohlcv.length<40) return {regime:"UNKNOWN",confidence:0,regimeMult:0,label:"INSUFFICIENT"};
+    const closes=ohlcv.map(c=>c.close);
+    const returns=[];
+    for(let i=1;i<closes.length;i++) returns.push((closes[i]-closes[i-1])/closes[i-1]);
+    const r20=returns.slice(-20);
+    const r5=returns.slice(-5);
+
+    const mean20=r20.reduce((a,b)=>a+b,0)/r20.length;
+    const std20=Math.sqrt(r20.reduce((a,b)=>a+(b-mean20)**2,0)/r20.length)||0.001;
+    const mean5=r5.reduce((a,b)=>a+b,0)/r5.length;
+
+    // Trend score: momentum + Hurst proxy
+    const momentumScore=Math.abs(mean5)/std20; // normalized momentum
+    const directionality=mean5/std20; // positive=up trend, negative=down trend
+
+    // Volatility clustering
+    const vol5=Math.sqrt(r5.reduce((a,b)=>a+b**2,0)/r5.length);
+    const volRatio=vol5/(std20||0.001);
+
+    // Price vs moving avg
+    const ma20=closes.slice(-20).reduce((a,b)=>a+b,0)/20;
+    const lastClose=closes[closes.length-1];
+    const pricePos=(lastClose-ma20)/ma20;
+
+    // Regime classification
+    let regime,confidence;
+    if(momentumScore>1.5&&Math.abs(pricePos)>0.02){
+      regime="TREND";
+      confidence=Math.min(0.95,0.6+momentumScore*0.1);
+    } else if(volRatio<0.8&&Math.abs(pricePos)<0.015){
+      regime="SIDEWAYS";
+      confidence=Math.min(0.95,0.65+(0.8-volRatio)*0.3);
+    } else {
+      regime="MEAN_REVERT";
+      confidence=Math.min(0.90,0.55+Math.abs(pricePos)*2);
+    }
+
+    // 3-tier confidence
+    let confLabel,regimeMult;
+    if(confidence>0.7){confLabel="STRONG";regimeMult=confidence;}
+    else if(confidence>=0.55){confLabel="WEAK";regimeMult=confidence;}
+    else {confLabel="SKIP";regimeMult=0;}
+
+    return {regime,confidence,confLabel,regimeMult,directionality,label:`${regime} [${confLabel}]`};
+  },
+};
+
+// ============================================================
+// V2.0 — LEVEL 3: KALMAN FILTER + RLS
+// ============================================================
+const KalmanRLS = {
+  // Kalman Filter — clean price estimator
+  kalman(prices, processNoise=1e-4, measureNoise=1e-2) {
+    if(!prices||prices.length<5) return prices||[];
+    let x=prices[0], P=1.0;
+    const filtered=[];
+    for(const z of prices){
+      // Predict
+      const xPred=x;
+      const PPred=P+processNoise;
+      // Update
+      const K=PPred/(PPred+measureNoise);
+      x=xPred+K*(z-xPred);
+      P=(1-K)*PPred;
+      filtered.push(isFinite(x)?x:z);
+    }
+    return filtered;
+  },
+
+  // RLS Adaptive Filter — dynamic trend line
+  rls(prices, lambda=0.97, initP=10) {
+    if(!prices||prices.length<5) return {line:[],slope:"FLAT"};
+    const n=prices.length;
+    let w=[prices[0],0]; // [intercept, slope]
+    let P=[[initP,0],[0,initP]];
+    const line=[];
+    for(let i=1;i<n;i++){
+      const x=[1,i];
+      const y=prices[i];
+      // Predict
+      const yHat=w[0]*x[0]+w[1]*x[1];
+      const e=y-yHat;
+      // Gain
+      const Px=[P[0][0]*x[0]+P[0][1]*x[1], P[1][0]*x[0]+P[1][1]*x[1]];
+      const denom=lambda+(x[0]*Px[0]+x[1]*Px[1]);
+      if(Math.abs(denom)<1e-10){line.push(yHat);continue;}
+      const k=[Px[0]/denom, Px[1]/denom];
+      // Update weights
+      w=[w[0]+k[0]*e, w[1]+k[1]*e];
+      // Update P
+      const kx=[[k[0]*x[0],k[0]*x[1]],[k[1]*x[0],k[1]*x[1]]];
+      P=[[P[0][0]/lambda-kx[0][0]/lambda, P[0][1]/lambda-kx[0][1]/lambda],
+         [P[1][0]/lambda-kx[1][0]/lambda, P[1][1]/lambda-kx[1][1]/lambda]];
+      line.push(isFinite(yHat)?yHat:prices[i]);
+    }
+    // Slope direction from last few points
+    const lastSlope=w[1];
+    const slope=lastSlope>prices[n-1]*0.0001?"UP":lastSlope<-prices[n-1]*0.0001?"DOWN":"FLAT";
+    return {line,slope,rawSlope:lastSlope};
+  },
+
+  // Combined execution score (weighted, max 6)
+  executionScore(ohlcv, hqArr, struct, liq) {
+    if(!ohlcv||ohlcv.length<20) return {score:0,details:[],execute:false};
+    const prices=ohlcv.map(c=>c.close);
+    const lastPrice=prices[prices.length-1];
+
+    const kFiltered=this.kalman(prices);
+    const kalmanClean=kFiltered[kFiltered.length-1]||lastPrice;
+    const rlsResult=this.rls(prices);
+
+    // H(q) stability
+    const H=hqArr?MFDFA.hurst(hqArr):0.5;
+    const hqStable=H>0.5&&isFinite(H);
+
+    const details=[
+      {label:"BOS/CHOCH CONFIRMED", weight:2, active:(struct?.bos?.length>0||struct?.choch?.length>0)},
+      {label:"PRICE > KALMAN LINE",  weight:1, active:lastPrice>kalmanClean},
+      {label:"RLS SLOPE UP",         weight:1, active:rlsResult.slope==="UP"},
+      {label:"H(q) STABLE > 0.5",   weight:1, active:hqStable},
+      {label:"LIQUIDITY PRESSURE",   weight:1, active:(liq?.score||0)>50},
+    ];
+
+    const score=details.reduce((a,d)=>a+(d.active?d.weight:0),0);
+    return {score,details,execute:score>=4,kalmanClean,rlsSlope:rlsResult.slope,rlsLine:rlsResult.line};
+  },
+};
+
+// ============================================================
+// V2.0 — LEVEL 4+5: POSITION SIZING + EXIT LOGIC
+// ============================================================
+const SizingEngine = {
+  // Final position size — all multipliers combined (no double PE)
+  compute(chaosResult, regimeResult, volRegime) {
+    if(!chaosResult||chaosResult.hardKill) return {size:0,pct:0,blocked:"HARD_KILL"};
+    if(!regimeResult||regimeResult.confLabel==="SKIP") return {size:0,pct:0,blocked:"REGIME_SKIP"};
+
+    const pe=chaosResult.pe;
+    const lambda=Math.max(0,chaosResult.lambda);
+    const lambdaNorm=Math.min(1,lambda/0.1);
+
+    // Single unified risk — no double PE
+    const risk=(1-pe)*(1-lambdaNorm);
+
+    // Regime confidence penalty
+    const regimeMult=regimeResult.regimeMult;
+
+    // Volatility adjustment
+    const atrPct=(volRegime?.pct||2)/100;
+    const volMult=1/(1+atrPct);
+
+    // Soft kill: chaos_mult already captured in risk via (1-PE)
+    const rawSize=risk*regimeMult*volMult;
+    const pct=Math.max(0,Math.min(1,rawSize));
+
+    return {
+      size:pct,
+      pct:+(pct*100).toFixed(1),
+      risk:+risk.toFixed(3),
+      regimeMult:+regimeMult.toFixed(3),
+      volMult:+volMult.toFixed(3),
+      blocked:null,
+    };
+  },
+
+  // Exit signal check
+  exitCheck(currentPrice, kalmanClean, rlsLine, currentRegime, entryRegime) {
+    const reasons=[];
+    if(currentPrice<kalmanClean) reasons.push("PRICE BELOW KALMAN");
+    if(rlsLine&&rlsLine.length>2){
+      const last2=rlsLine.slice(-2);
+      if(last2[1]<last2[0]) reasons.push("RLS SLOPE REVERSED");
+    }
+    if(currentRegime&&entryRegime&&currentRegime!==entryRegime) reasons.push("REGIME CHANGED");
+    return {shouldExit:reasons.length>0,reasons};
+  },
+};
+
+// ============================================================
+// V2.0 — FULL DECISION HIERARCHY (combine all levels)
+// ============================================================
+function useV2Analysis(ohlcv, hqArr, struct, liq, volRegime) {
+  return useMemo(()=>{
+    if(!ohlcv||ohlcv.length<40) return null;
+    try {
+      const chaos=ChaosEngine.assess(ohlcv);
+      const regime=RegimeEngine.detect(ohlcv);
+      const exec=KalmanRLS.executionScore(ohlcv,hqArr,struct,liq);
+      const sizing=SizingEngine.compute(chaos,regime,volRegime);
+
+      // Chaos cooldown: count bars since last chaos
+      const recentPrices=ohlcv.slice(-20).map(c=>c.close);
+      const kLine=KalmanRLS.kalman(recentPrices);
+      const lastKalman=kLine[kLine.length-1];
+
+      // Exit check (against current price vs kalman + rls)
+      const currentPrice=ohlcv[ohlcv.length-1].close;
+      const exitSignal=SizingEngine.exitCheck(
+        currentPrice,lastKalman,exec.rlsLine,
+        regime.regime,"TREND"
+      );
+
+      return {chaos,regime,exec,sizing,exitSignal,kalmanClean:exec.kalmanClean,rlsSlope:exec.rlsSlope};
+    } catch(e) {
+      console.warn("V2 analysis error:",e.message);
+      return null;
+    }
+  },[ohlcv,hqArr,struct,liq,volRegime]);
+}
+
+// ============================================================
 // BACKTEST ENGINE — With slippage, fee, CPCV
 // ============================================================
 const Backtest = {
@@ -1024,7 +1339,7 @@ function Sidebar({watchlist,active,onSelect,onAdd,onRemove,onHome}){
         {watchlist.length===0&&<div style={{fontSize:"8px",color:"var(--text-dead)",textAlign:"center",padding:"10px"}}>ADD ASSETS TO WATCH</div>}
       </div>
       <div style={{padding:"8px 10px",borderTop:"1px solid var(--border)"}}>
-        {["MF-DFA ENGINE","f(α) SPECTRUM","POLY DETREND","BOS/CHOCH","VOL SCALING","OOS+CPCV","QUANT GUARD"].map(s=>(
+        {["MF-DFA ENGINE","f(α) SPECTRUM","CHAOS GATE","HMM REGIME","KALMAN+RLS","SIZING ENGINE","EXIT LOGIC"].map(s=>(
           <div key={s} style={{display:"flex",justifyContent:"space-between",padding:"2px 0",fontSize:"7px"}}>
             <span style={{color:"var(--text-dead)"}}>{s}</span>
             <span style={{color:"var(--neon)"}}>●</span>
@@ -1076,9 +1391,10 @@ function AlertTicker({watchlist,cache}){
 function Dashboard({asset,data,loading}){
   const [tab,setTab]=useState("OVERVIEW");
   const [tf,setTf]=useState(TIMEFRAMES[3]); // default 1D
-  const TABS=["OVERVIEW","FRACTAL","STRUCTURE","BACKTEST","BEHAVIOR"];
+  const TABS=["OVERVIEW","FRACTAL","STRUCTURE","BACKTEST","BEHAVIOR","V2 REGIME"];
   const analysis=useMFDFA(data?.ohlcv);
   const meta=data?.meta||{};
+  const v2=useV2Analysis(data?.ohlcv,analysis?.hqArr,analysis?.struct,analysis?.liq,analysis?.vol);
   const fmtP=p=>!p?"—":p<0.0001?p.toExponential(3):p<0.01?p.toFixed(8):p<1?p.toFixed(6):p.toFixed(2);
   const fmtV=v=>!v?"—":v>1e9?`$${(v/1e9).toFixed(2)}B`:v>1e6?`$${(v/1e6).toFixed(2)}M`:v>1e3?`$${(v/1e3).toFixed(1)}K`:`$${v.toFixed(0)}`;
 
@@ -1308,7 +1624,140 @@ function Dashboard({asset,data,loading}){
           </>
         )}
 
-        {tab==="BEHAVIOR"&&analysis&&(
+        {tab==="V2 REGIME"&&(
+          <>
+            {!v2?(
+              <Panel><div style={{padding:"30px",textAlign:"center"}}><div style={{fontSize:"10px",color:"var(--amber)",letterSpacing:"3px"}}>INSUFFICIENT DATA FOR V2 ANALYSIS</div></div></Panel>
+            ):(
+              <>
+                {/* Level 1 — Chaos Gate */}
+                <Panel style={{marginBottom:"8px",borderColor:v2.chaos.hardKill?"var(--red)":v2.chaos.softKill?"var(--amber)":"var(--neon)"}}>
+                  <PanelLabel color={v2.chaos.hardKill?"var(--red)":v2.chaos.softKill?"var(--amber)":"var(--neon)"}>LVL 1 — CHAOS GATE</PanelLabel>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:"8px"}}>
+                    <div style={{padding:"10px",background:v2.chaos.hardKill?"var(--red-ghost)":v2.chaos.softKill?"var(--amber-ghost)":"var(--neon-ghost)",border:`1px solid ${v2.chaos.hardKill?"var(--red)":v2.chaos.softKill?"var(--amber)":"var(--neon-dim)"}`,textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"4px"}}>STATUS</div>
+                      <div style={{fontSize:"9px",fontWeight:800,color:v2.chaos.hardKill?"var(--red)":v2.chaos.softKill?"var(--amber)":"var(--neon)",letterSpacing:"2px"}}>{v2.chaos.status.replace(/_/g," ")}</div>
+                    </div>
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"4px"}}>PERM ENTROPY</div>
+                      <div style={{fontSize:"18px",fontWeight:800,color:v2.chaos.pe>0.75?"var(--red)":v2.chaos.pe>0.6?"var(--amber)":"var(--neon)"}}>{v2.chaos.pe.toFixed(3)}</div>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)"}}>threshold 0.75</div>
+                    </div>
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"4px"}}>LYAPUNOV λ</div>
+                      <div style={{fontSize:"18px",fontWeight:800,color:v2.chaos.lambda>ChaosEngine.LYAPUNOV_BUFFER?"var(--red)":"var(--neon)"}}>{v2.chaos.lambda.toFixed(4)}</div>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)"}}>buffer {ChaosEngine.LYAPUNOV_BUFFER}</div>
+                    </div>
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"4px"}}>CHAOS MULT</div>
+                      <div style={{fontSize:"18px",fontWeight:800,color:"var(--blue)"}}>{v2.chaos.chaosMult.toFixed(3)}</div>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)"}}>→ sizing</div>
+                    </div>
+                  </div>
+                </Panel>
+
+                {/* Level 2 — Regime */}
+                <Panel style={{marginBottom:"8px",borderColor:v2.regime.confLabel==="STRONG"?"var(--neon)":v2.regime.confLabel==="WEAK"?"var(--amber)":"var(--red)"}}>
+                  <PanelLabel color={v2.regime.confLabel==="STRONG"?"var(--neon)":v2.regime.confLabel==="WEAK"?"var(--amber)":"var(--red)"}>LVL 2 — REGIME DETECTION</PanelLabel>
+                  <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:"8px"}}>
+                    <div style={{padding:"12px",textAlign:"center",background:v2.regime.regime==="TREND"?"var(--neon-ghost)":v2.regime.regime==="SIDEWAYS"?"var(--blue-ghost)":"var(--amber-ghost)",border:`1px solid ${v2.regime.regime==="TREND"?"var(--neon-dim)":v2.regime.regime==="SIDEWAYS"?"var(--blue)":"var(--amber)"}`}}>
+                      <div style={{fontSize:"20px",fontWeight:800,letterSpacing:"4px",color:v2.regime.regime==="TREND"?"var(--neon)":v2.regime.regime==="SIDEWAYS"?"var(--blue)":"var(--amber)"}}>{v2.regime.regime}</div>
+                      <div style={{fontSize:"8px",color:"var(--text-muted)",marginTop:"4px"}}>{v2.regime.confLabel}</div>
+                    </div>
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px"}}>CONFIDENCE</div>
+                      <div style={{fontSize:"22px",fontWeight:800,color:v2.regime.confidence>0.7?"var(--neon)":v2.regime.confidence>=0.55?"var(--amber)":"var(--red)"}}>{(v2.regime.confidence*100).toFixed(0)}%</div>
+                    </div>
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px"}}>REGIME MULT</div>
+                      <div style={{fontSize:"22px",fontWeight:800,color:"var(--blue)"}}>{v2.regime.regimeMult.toFixed(3)}</div>
+                    </div>
+                  </div>
+                  <div style={{marginTop:"8px",display:"flex",gap:"6px"}}>
+                    {["TREND","MEAN_REVERT","SIDEWAYS"].map(r=>(
+                      <div key={r} style={{flex:1,padding:"5px",textAlign:"center",background:v2.regime.regime===r?"var(--neon-ghost)":"var(--bg-deep)",border:`1px solid ${v2.regime.regime===r?"var(--neon-dim)":"var(--border)"}`,fontSize:"8px",color:v2.regime.regime===r?"var(--neon)":"var(--text-muted)"}}>{r.replace("_"," ")}</div>
+                    ))}
+                  </div>
+                </Panel>
+
+                {/* Level 3 — Execution Scoring */}
+                <Panel style={{marginBottom:"8px",borderColor:v2.exec.execute?"var(--neon)":"var(--border)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
+                    <PanelLabel color={v2.exec.execute?"var(--neon)":"var(--amber)"}>LVL 3 — EXECUTION SCORING [{v2.exec.score}/6]</PanelLabel>
+                    <Badge label={v2.exec.execute?"EXECUTE ≥4":"HOLD <4"} color={v2.exec.execute?"var(--neon)":"var(--red)"}/>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:"4px",marginBottom:"10px"}}>
+                    {v2.exec.details.map((d,i)=>(
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:"8px",padding:"7px 10px",background:d.active?"var(--neon-ghost)":"var(--bg-deep)",border:`1px solid ${d.active?"var(--neon-dim)33":"var(--border)"}`,}}>
+                        <span style={{color:d.active?"var(--neon)":"var(--text-dead)",fontSize:"10px"}}>{d.active?"●":"○"}</span>
+                        <span style={{flex:1,fontSize:"9px",color:d.active?"var(--text-primary)":"var(--text-muted)",letterSpacing:"1px"}}>{d.label}</span>
+                        <span style={{fontSize:"9px",fontWeight:800,color:d.active?"var(--neon)":"var(--text-muted)"}}>+{d.weight}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
+                    <div style={{padding:"8px",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"3px"}}>KALMAN CLEAN PRICE</div>
+                      <div style={{fontSize:"13px",color:"var(--blue)",fontWeight:700}}>${fmtP(v2.kalmanClean)}</div>
+                    </div>
+                    <div style={{padding:"8px",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"3px"}}>RLS SLOPE</div>
+                      <div style={{fontSize:"13px",color:v2.rlsSlope==="UP"?"var(--neon)":v2.rlsSlope==="DOWN"?"var(--red)":"var(--amber)",fontWeight:700}}>{v2.rlsSlope}</div>
+                    </div>
+                  </div>
+                </Panel>
+
+                {/* Level 4 — Position Sizing */}
+                <Panel style={{marginBottom:"8px",borderColor:v2.sizing.blocked?"var(--red)":"var(--blue)"}}>
+                  <PanelLabel color="var(--blue)">LVL 4 — POSITION SIZING ENGINE</PanelLabel>
+                  {v2.sizing.blocked?(
+                    <div style={{padding:"12px",textAlign:"center",background:"var(--red-ghost)",border:"1px solid var(--red)33",fontSize:"10px",color:"var(--red)",letterSpacing:"3px"}}>⛔ BLOCKED — {v2.sizing.blocked.replace(/_/g," ")}</div>
+                  ):(
+                    <>
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"8px",marginBottom:"8px"}}>
+                        {[
+                          {label:"RISK",val:v2.sizing.risk,color:"var(--amber)"},
+                          {label:"REGIME MULT",val:v2.sizing.regimeMult,color:"var(--neon)"},
+                          {label:"VOL MULT",val:v2.sizing.volMult,color:"var(--blue)"},
+                          {label:"FINAL SIZE",val:`${v2.sizing.pct}%`,color:v2.sizing.pct>60?"var(--neon)":v2.sizing.pct>30?"var(--amber)":"var(--red)"},
+                        ].map(m=>(
+                          <div key={m.label} style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                            <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px"}}>{m.label}</div>
+                            <div style={{fontSize:"16px",fontWeight:800,color:m.color}}>{typeof m.val==="number"?m.val.toFixed(3):m.val}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{height:"8px",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                        <div style={{height:"100%",width:`${v2.sizing.pct}%`,background:`linear-gradient(90deg,var(--blue),var(--neon))`,transition:"width 0.5s"}}/>
+                      </div>
+                      <div style={{fontSize:"8px",color:"var(--text-muted)",marginTop:"4px",textAlign:"center"}}>risk=(1-PE)×(1-λ_norm) × regime × vol_adj — no double penalty</div>
+                    </>
+                  )}
+                </Panel>
+
+                {/* Level 5 — Exit Logic */}
+                <Panel style={{borderColor:v2.exitSignal.shouldExit?"var(--red)":"var(--border)"}}>
+                  <PanelLabel color={v2.exitSignal.shouldExit?"var(--red)":"var(--neon)"}>LVL 5 — EXIT LOGIC MONITOR</PanelLabel>
+                  <div style={{padding:"12px",textAlign:"center",background:v2.exitSignal.shouldExit?"var(--red-ghost)":"var(--neon-ghost)",border:`1px solid ${v2.exitSignal.shouldExit?"var(--red)":"var(--neon-dim)"}33`,marginBottom:"8px"}}>
+                    <div style={{fontSize:"14px",fontWeight:800,letterSpacing:"4px",color:v2.exitSignal.shouldExit?"var(--red)":"var(--neon)"}}>{v2.exitSignal.shouldExit?"⚠ EXIT SIGNAL ACTIVE":"✓ HOLD — NO EXIT TRIGGER"}</div>
+                  </div>
+                  {v2.exitSignal.reasons.length>0&&(
+                    <div style={{display:"flex",flexDirection:"column",gap:"4px"}}>
+                      {v2.exitSignal.reasons.map((r,i)=>(
+                        <div key={i} style={{padding:"6px 10px",background:"var(--red-ghost)",border:"1px solid var(--red)22",fontSize:"9px",color:"var(--red)",letterSpacing:"2px"}}>⛔ {r}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{marginTop:"8px",fontSize:"8px",color:"var(--text-muted)",lineHeight:1.8,padding:"6px",background:"var(--bg-deep)"}}>
+                    Dynamic Trailing: Close if Price &lt; Kalman OR RLS flips DOWN<br/>
+                    Regime Invalidation: Reduce/Close if regime shifts mid-trade
+                  </div>
+                </Panel>
+              </>
+            )}
+          </>
+        )}
+
           <>
             <SignalCard trade={analysis.scoreData.trade} symbol={meta.symbol||asset.symbol}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginTop:"8px"}}>
@@ -1422,7 +1871,7 @@ export default function App() {
           <span style={{fontSize:"8px",color:"var(--text-muted)",letterSpacing:"1px"}}>{time}</span>
           <Badge label="MF-DFA" color="var(--purple)"/>
           <Badge label="OOS" color="var(--blue)"/>
-          <Badge label="v3" color="var(--neon)"/>
+          <Badge label="v4" color="var(--neon)"/>
         </div>
       </div>
 
