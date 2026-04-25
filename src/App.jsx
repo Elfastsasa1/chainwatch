@@ -290,16 +290,32 @@ const DataFetcher = {
 
   // Trending tokens from DexScreener
   async fetchTrending() {
-    try {
-      const res = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
-      const json = await res.json();
-      return (Array.isArray(json) ? json : []).slice(0, 12).map(t=>({
-        address: t.tokenAddress, symbol: t.symbol||"???", name: t.description||t.symbol||"Unknown",
-        chain: t.chainId||"ethereum", type:"evm",
-        icon: t.icon || null,
+  try {
+    // Endpoint 1: boosted tokens (ada symbol)
+    const res = await fetch("https://api.dexscreener.com/token-boosts/top/v1");
+    const json = await res.json();
+    const tokens = Array.isArray(json) ? json : [];
+    if (tokens.length > 0) {
+      return tokens.slice(0, 12).map(t => ({
+        address: t.tokenAddress,
+        symbol: t.symbol || t.tokenAddress?.slice(2,8).toUpperCase() || "???",
+        name: t.description?.slice(0,40) || t.symbol || "Unknown",
+        chain: t.chainId || "ethereum",
+        type: "evm",
       }));
-    } catch { return []; }
-  },
+    }
+    // Fallback endpoint 2
+    const res2 = await fetch("https://api.dexscreener.com/token-profiles/latest/v1");
+    const json2 = await res2.json();
+    return (Array.isArray(json2) ? json2 : []).slice(0, 12).map(t => ({
+      address: t.tokenAddress,
+      symbol: t.symbol || t.tokenAddress?.slice(2,8).toUpperCase() || "???",
+      name: t.description?.slice(0,40) || "Unknown",
+      chain: t.chainId || "ethereum",
+      type: "evm",
+    }));
+  } catch { return []; }
+},
 };
 
 // ============================================================
