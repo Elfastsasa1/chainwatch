@@ -850,7 +850,9 @@ const DataFetcher = {
       `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`
     );
     const json = await res.json();
-    if(!Array.isArray(json)||json.length<10) return null;
+    const data=Array.isArray(json)?json:(json?.status?.error_code===429?(await (await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`)).json()):null);
+    if(!Array.isArray(data)||data.length<10) return null;
+    const ohlcv=data.map(([t,o,h,l,c])=>({
 
     // Format: [timestamp, open, high, low, close]
     const ohlcv = json.map(([t,o,h,l,c])=>({
