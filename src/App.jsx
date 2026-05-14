@@ -992,7 +992,7 @@ function LoadingDots({label="SCANNING"}){
 }
 
 function SourceBadge({source}){
-  const cfg={live:{l:"LIVE",c:"var(--neon)"},twelvedata:{l:"12DATA",c:"var(--blue)"},mock:{l:"SIM ⚠",c:"var(--amber)"},dexscreener:{l:"DEX",c:"var(--purple)"}};
+  const cfg={live:{l:"LIVE",c:"var(--neon)"},binance:{l:"BINANCE",c:"var(--neon)"},twelvedata:{l:"12DATA",c:"var(--blue)"},coingecko:{l:"GECKO",c:"var(--blue)"},mock:{l:"SIM ⚠",c:"var(--amber)"},dexscreener:{l:"DEX",c:"var(--purple)"}};
   const x=cfg[source]||cfg.mock;
   return <Badge label={x.l} color={x.c}/>;
 }
