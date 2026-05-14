@@ -855,7 +855,7 @@ const DataFetcher = {
     const ohlcv=data.map(([t,o,h,l,c])=>({
 
     // Format: [timestamp, open, high, low, close]
-    const ohlcv = json.map(([t,o,h,l,c])=>({
+    const ohlcv = data.map(([t,o,h,l,c])=>({
       time: Math.floor(t/1000),
       open: +o, high: +h, low: +l, close: +c,
       volume: 0 // OHLC endpoint tidak include volume
