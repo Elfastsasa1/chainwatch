@@ -838,45 +838,37 @@ const DataFetcher = {
 
   async fetchCryptoPrice(symbol) {
   try {
-    const coinMap = {
-      "BTC/USD":"bitcoin","ETH/USD":"ethereum","BNB/USD":"binancecoin",
-      "SOL/USD":"solana","ARB/USD":"arbitrum","MATIC/USD":"matic-network"
+    const binanceMap = {
+      "BTC/USD":"BTCUSDT","ETH/USD":"ETHUSDT","BNB/USD":"BNBUSDT",
+      "SOL/USD":"SOLUSDT","ARB/USD":"ARBUSDT","MATIC/USD":"MATICUSDT"
     };
-    const coinId = coinMap[symbol];
-    if(!coinId) return null;
-
-    // OHLC endpoint — return data OHLC asli, bukan fake
+    const pair = binanceMap[symbol];
+    if(!pair) return null;
     const res = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`
+      `https://api.binance.com/api/v3/klines?symbol=${pair}&interval=1d&limit=365`
     );
     const json = await res.json();
-    const data=Array.isArray(json)?json:(json?.status?.error_code===429?(await (await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`)).json()):null);
-    if(!Array.isArray(data)||data.length<10) return null;
-    
-    // Format: [timestamp, open, high, low, close]
-    const ohlcv = data.map(([t,o,h,l,c])=>({
-      time: Math.floor(t/1000),
-      open: +o, high: +h, low: +l, close: +c,
-      volume: 0 // OHLC endpoint tidak include volume
-    }));
-
-    
-
+    if(!Array.isArray(json)||json.length<10) return null;
+    const ohlcv = json.map(d=>({
+      time: Math.floor(d[0]/1000),
+      open: +d[1], high: +d[2], low: +d[3], close: +d[4],
+      volume: +d[5]
+    })).filter(c=>c.close>0);
     const last = ohlcv[ohlcv.length-1];
     const prev = ohlcv[ohlcv.length-2];
     const change24h = prev?((last.close-prev.close)/prev.close)*100:0;
-
     return {
       ohlcv,
-      source:"coingecko",
+      source:"binance",
       meta:{
-        symbol, name:coinId, type:"crypto12",
+        symbol, name:pair, type:"crypto12",
         price:last.close, change24h,
         volume24h:last.volume, liquidity:0, txns:null
       }
     };
   } catch { return null; }
 },
+   
   async fetchTwelve(symbol, type, tf=TIMEFRAMES[3]) {
     const noKey=!TWELVE_API_KEY||TWELVE_API_KEY==="373d4dee7c35444fbb9d3073a6444b95";
     const base=type==="forex"?(0.9+Math.random()*0.5):type==="stock"?(50+Math.random()*300):(100+Math.random()*50000);
