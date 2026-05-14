@@ -860,18 +860,7 @@ const DataFetcher = {
       volume: 0 // OHLC endpoint tidak include volume
     }));
 
-    // Fetch volume terpisah
-    try {
-      const volRes = await fetch(
-        `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=365&interval=daily`
-      );
-      const volJson = await volRes.json();
-      if(volJson.total_volumes) {
-        volJson.total_volumes.forEach(([t,v],i)=>{
-          if(ohlcv[i]) ohlcv[i].volume = v;
-        });
-      }
-    } catch {}
+    
 
     const last = ohlcv[ohlcv.length-1];
     const prev = ohlcv[ohlcv.length-2];
