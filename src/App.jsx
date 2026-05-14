@@ -847,7 +847,7 @@ const DataFetcher = {
 
     // OHLC endpoint — return data OHLC asli, bukan fake
     const res = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=180`
+      `https://api.coingecko.com/api/v3/coins/${coinId}/ohlc?vs_currency=usd&days=365`
     );
     const json = await res.json();
     if(!Array.isArray(json)||json.length<10) return null;
@@ -861,7 +861,7 @@ const DataFetcher = {
 
     // Fetch volume terpisah
     const volRes = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=180&interval=daily`
+      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=365&interval=daily`
     );
     const volJson = await volRes.json();
     if(volJson.total_volumes) {
@@ -1388,13 +1388,231 @@ function AlertTicker({watchlist,cache}){
 // ============================================================
 // MAIN ASSET DASHBOARD
 // ============================================================
+// NASH BEHAVIOR ENGINE
+// Weighted: SMC/Wick 35%, Volume/Liq 30%, Vol/Trend 25%, Extra 10%
+// ============================================================
+const NashEngine = {
+  analyze(ohlcv, struct, liq, vol, beh, hqArr) {
+    if(!ohlcv||ohlcv.length<30) return null;
+    try {
+      const n=ohlcv.length;
+      const recent=ohlcv.slice(-20);
+      const last=ohlcv[n-1];
+      const prices=ohlcv.map(c=>c.close);
+      const highs=ohlcv.map(c=>c.high);
+      const lows=ohlcv.map(c=>c.low);
+      const volumes=ohlcv.map(c=>c.volume||0);
+      // SMC/WICK 35%
+      const wickScores=recent.map(c=>{
+        const totalRange=(c.high-c.low)||0.0001;
+        const upperWick=c.high-Math.max(c.open,c.close);
+        const lowerWick=Math.min(c.open,c.close)-c.low;
+        return{upperRatio:upperWick/totalRange,lowerRatio:lowerWick/totalRange};
+      });
+      const avgUpperWick=wickScores.reduce((a,w)=>a+w.upperRatio,0)/wickScores.length;
+      const avgLowerWick=wickScores.reduce((a,w)=>a+w.lowerRatio,0)/wickScores.length;
+      const hasBOS=(struct?.bos?.length||0)>0;
+      const hasCHOCH=(struct?.choch?.length||0)>0;
+      const recentHigh=Math.max(...highs.slice(-20));
+      const recentLow=Math.min(...lows.slice(-20));
+      const priceRange=recentHigh-recentLow||0.0001;
+      const pricePosition=(last.close-recentLow)/priceRange;
+      let smcScore=50;
+      if(hasBOS) smcScore+=15;
+      if(hasCHOCH) smcScore-=10;
+      if(avgUpperWick>0.35) smcScore-=12;
+      if(avgLowerWick>0.35) smcScore+=12;
+      if(pricePosition>0.85) smcScore-=15;
+      if(pricePosition<0.15) smcScore+=15;
+      smcScore=Math.max(0,Math.min(100,smcScore));
+      // VOLUME/LIQ 30%
+      const avgVol=volumes.slice(-20).reduce((a,b)=>a+b,0)/20||1;
+      const lastVol=volumes[n-1]||0;
+      const volRatio=lastVol/avgVol;
+      const liqScore=liq?.score||50;
+      const volClimax=volRatio>2.5;
+      const volDry=volRatio<0.4;
+      let volumeLiqScore=50;
+      if(volClimax&&pricePosition>0.8) volumeLiqScore-=20;
+      if(volClimax&&pricePosition<0.2) volumeLiqScore+=20;
+      if(volDry) volumeLiqScore-=10;
+      volumeLiqScore+=(liqScore-50)*0.4;
+      volumeLiqScore=Math.max(0,Math.min(100,volumeLiqScore));
+      // VOL/TREND 25%
+      const H=hqArr?Math.max(0.05,Math.min(1.2,MFDFA.hurst(hqArr))):0.5;
+      const atrPct=vol?.pct||2;
+      const volRegime=vol?.regime||"MEDIUM";
+      const isExtreme=volRegime==="EXTREME";
+      const isTrending=H>0.58;
+      const isMeanRev=H<0.42;
+      const mom5=prices.slice(-5);
+      const momentum=(mom5[mom5.length-1]-mom5[0])/(mom5[0]||1)*100;
+      let volTrendScore=50;
+      if(isTrending&&momentum>0) volTrendScore+=20;
+      if(isTrending&&momentum<0) volTrendScore-=20;
+      if(isMeanRev) volTrendScore=50-(Math.abs(volTrendScore-50)*0.5);
+      if(isExtreme) volTrendScore=50+(volTrendScore-50)*0.3;
+      volTrendScore=Math.max(0,Math.min(100,volTrendScore));
+      // EXTRA 10%
+      const behType=beh?.type||"neutral";
+      let extraScore=50;
+      if(behType==="accum") extraScore=70;
+      if(behType==="dist") extraScore=30;
+      if(behType==="fomo") extraScore=25;
+      if(behType==="stophunt") extraScore=20;
+      // WEIGHTED COMPOSITE
+      const composite=smcScore*0.35+volumeLiqScore*0.30+volTrendScore*0.25+extraScore*0.10;
+      // CROWD BIAS
+      let crowdBias,crowdColor;
+      if(composite>62){crowdBias="LONG-BIASED";crowdColor="var(--neon)";}
+      else if(composite<38){crowdBias="SHORT-BIASED";crowdColor="var(--red)";}
+      else{crowdBias="NEUTRAL";crowdColor="var(--amber)";}
+      // TRAP RISK
+      const trapSignals=[
+        volClimax&&pricePosition>0.8,
+        avgUpperWick>0.4&&pricePosition>0.7,
+        hasCHOCH&&momentum>0,
+        volRatio>1.8&&hasBOS&&pricePosition>0.8,
+      ].filter(Boolean).length;
+      let trapRisk,trapColor;
+      if(trapSignals>=3){trapRisk="HIGH";trapColor="var(--red)";}
+      else if(trapSignals>=1){trapRisk="MEDIUM";trapColor="var(--amber)";}
+      else{trapRisk="LOW";trapColor="var(--neon)";}
+      // MM INCENTIVE
+      let mmIncentive,mmDesc;
+      if(pricePosition>0.88&&avgUpperWick>0.3){mmIncentive="SWEEP HIGHS";mmDesc="Price near resistance with upper wick rejection. MM likely to sweep stops above highs before reversal.";}
+      else if(pricePosition<0.12&&avgLowerWick>0.3){mmIncentive="SWEEP LOWS";mmDesc="Price near support with lower wick rejection. MM likely to grab liquidity below lows.";}
+      else if(volDry&&atrPct<1.5){mmIncentive="COMPRESSION → EXPANSION";mmDesc="Volume drying up in tight range. Likely accumulation before explosive move.";}
+      else if(volClimax&&hasBOS){mmIncentive="FAKE BREAKOUT";mmDesc="High volume BOS detected. Risk of false breakout and reversal to trap retail breakout traders.";}
+      else if(isTrending&&liqScore>65){mmIncentive="TREND CONTINUATION";mmDesc="Strong trend structure with healthy liquidity. MM has incentive to push in trend direction.";}
+      else{mmIncentive="LIQUIDITY GRAB";mmDesc="Market in range. MM probing for liquidity pockets before committing to direction.";}
+      // INTERPRETATION
+      let interpretation;
+      if(trapRisk==="HIGH") interpretation=`Retail traders heavily ${momentum>0?"long":"short"} near ${momentum>0?"resistance":"support"}. Stop hunt ${momentum>0?"above highs":"below lows"} probability elevated. Avoid chasing.`;
+      else if(crowdBias==="NEUTRAL") interpretation="Market appears balanced. No strong incentive asymmetry detected. Participant groups in equilibrium — wait for directional signal.";
+      else if(mmIncentive==="COMPRESSION → EXPANSION") interpretation="Smart money compressing price. Retail losing interest. Expect explosive breakout — direction uncertain until volume confirms.";
+      else interpretation=`${crowdBias==="LONG-BIASED"?"Bullish":"Bearish"} structure dominant. ${hasBOS?"BOS confirmed structural shift. ":""}${behType==="accum"?"Accumulation pattern supports upside.":behType==="dist"?"Distribution pattern cautions downside.":""}`;
+      // ACTION
+      let action,actionColor;
+      if(trapRisk==="HIGH"){action="AVOID ENTRY";actionColor="var(--red)";}
+      else if(mmIncentive==="COMPRESSION → EXPANSION"){action="WAIT FOR BREAKOUT";actionColor="var(--amber)";}
+      else if(crowdBias==="LONG-BIASED"&&trapRisk==="LOW"){action="MOMENTUM CONTINUATION";actionColor="var(--neon)";}
+      else if(crowdBias==="SHORT-BIASED"&&trapRisk==="LOW"){action="REVERSAL WATCH";actionColor="var(--purple)";}
+      else if(hasCHOCH){action="LOOK FOR RECLAIM";actionColor="var(--blue)";}
+      else{action="CONFIRM BREAKOUT";actionColor="var(--amber)";}
+      // CONFIDENCE
+      const dataQuality=Math.min(1,ohlcv.length/120);
+      const signalClarity=Math.abs(composite-50)/50;
+      const confidence=Math.round(40+signalClarity*40+dataQuality*20);
+      return{composite:Math.round(composite),crowdBias,crowdColor,trapRisk,trapColor,mmIncentive,mmDesc,interpretation,action,actionColor,confidence,weights:{smc:Math.round(smcScore),vol:Math.round(volumeLiqScore),trend:Math.round(volTrendScore),extra:Math.round(extraScore)},pricePosition:Math.round(pricePosition*100),volRatio:+volRatio.toFixed(2),wickData:{upper:+(avgUpperWick*100).toFixed(1),lower:+(avgLowerWick*100).toFixed(1)}};
+    }catch(e){console.warn("Nash error:",e.message);return null;}
+  }
+};
+
+// ============================================================
+// MCMC SCENARIO ENGINE — Dual TF: active + 1D bias
+// ============================================================
+const MCMCEngine={
+  _compute(candles,vol,hqArr,struct,label){
+    if(!candles||candles.length<20) return null;
+    const n=candles.length;
+    const prices=candles.map(c=>c.close);
+    const returns=[];
+    for(let i=1;i<prices.length;i++) returns.push((prices[i]-prices[i-1])/(prices[i-1]||1));
+    const r20=returns.slice(-20);
+    const r5=returns.slice(-5);
+    const mean20=r20.reduce((a,b)=>a+b,0)/r20.length;
+    const std20=Math.sqrt(r20.reduce((a,b)=>a+(b-mean20)**2,0)/r20.length)||0.001;
+    const mean5=r5.reduce((a,b)=>a+b,0)/r5.length;
+    const momentum=mean5/std20;
+    const H=hqArr?Math.max(0.05,Math.min(1.2,MFDFA.hurst(hqArr))):0.5;
+    const volumes=candles.map(c=>c.volume||0);
+    const avgV=volumes.slice(-20).reduce((a,b)=>a+b,0)/20||1;
+    const lastV=volumes[n-1]||0;
+    const volRatio=lastV/avgV;
+    const atrPct=vol?.pct||2;
+    const uncertainty=Math.min(1,atrPct/10);
+    let pBull=H>0.5?33+(H-0.5)*40:33-(0.5-H)*30;
+    let pBear=H<0.5?33+(0.5-H)*40:33-(H-0.5)*30;
+    let pSide=100-pBull-pBear;
+    pBull+=momentum*8*(1-uncertainty);
+    pBear-=momentum*8*(1-uncertainty);
+    if(volRatio>1.5&&momentum>0) pBull+=6;
+    if(volRatio>1.5&&momentum<0) pBear+=6;
+    if(volRatio<0.5) pSide+=8;
+    if((struct?.bos?.length||0)>0&&momentum>0) pBull+=8;
+    if((struct?.choch?.length||0)>0){pBull-=5;pBear+=5;}
+    const pt=(prices[prices.length-1]-prices[0])/(prices[0]||1);
+    const vs=lastV/avgV;
+    const behType=vs>2.5&&pt>0.05?"fomo":vs>2.0&&pt<-0.05?"stophunt":pt>0.02&&vs>1.3?"accum":pt<-0.02&&vs>1.3?"dist":"neutral";
+    if(behType==="accum") pBull+=10;
+    if(behType==="dist") pBear+=10;
+    if(behType==="fomo"){pBull-=5;pBear+=8;}
+    pBull=pBull*(1-uncertainty*0.4)+33*uncertainty*0.4;
+    pBear=pBear*(1-uncertainty*0.4)+33*uncertainty*0.4;
+    pSide=pSide*(1-uncertainty*0.4)+33*uncertainty*0.4;
+    pBull=Math.max(5,Math.min(88,pBull));
+    pBear=Math.max(5,Math.min(88,pBear));
+    pSide=Math.max(5,Math.min(60,pSide));
+    const total=pBull+pBear+pSide;
+    pBull=Math.round(pBull/total*100);
+    pBear=Math.round(pBear/total*100);
+    pSide=100-pBull-pBear;
+    const maxP=Math.max(pBull,pBear,pSide);
+    const confLabel=maxP>70?"HIGH":maxP>55?"MEDIUM":"LOW";
+    const confColor=maxP>70?"var(--neon)":maxP>55?"var(--amber)":"var(--text-muted)";
+    const dominant=pBull>pBear&&pBull>pSide?"BULLISH":pBear>pBull&&pBear>pSide?"BEARISH":"SIDEWAYS";
+    const momStr=Math.abs(momentum)>1.5?"strong":Math.abs(momentum)>0.5?"moderate":"weak";
+    const volStr=volRatio>1.5?"elevated":volRatio<0.6?"low":"normal";
+    let explanation;
+    if(uncertainty>0.7) explanation=`High uncertainty: ATR ${atrPct.toFixed(1)}% is elevated. Probability spread is wide — avoid high-confidence bets.`;
+    else if(dominant==="BULLISH") explanation=`Bullish probability elevated due to ${momStr} upside momentum, ${volStr} volume, H=${H.toFixed(2)} persistent structure.${behType==="accum"?" Accumulation adds confluence.":""}`;
+    else if(dominant==="BEARISH") explanation=`Bearish pressure dominant. ${momStr} downside momentum with ${volStr} volume. H=${H.toFixed(2)}.`;
+    else explanation=`Low momentum / compression phase. No clear directional edge.${volRatio<0.6?" Volume drying — breakout likely ahead.":""}`;
+    return{pBull,pBear,pSide,dominant,confLabel,confColor,explanation,label,uncertainty:Math.round(uncertainty*100)};
+  },
+  run(ohlcv,ohlcv1D,vol,hqArr,struct,tf){
+    if(!ohlcv||ohlcv.length<30) return null;
+    try{
+      const exec=this._compute(ohlcv,vol,hqArr,struct,tf?.label||"ACTIVE");
+      const bias=this._compute(ohlcv1D||ohlcv,vol,hqArr,struct,"1D BIAS");
+      if(!exec) return null;
+      const synthBull=bias?Math.round(exec.pBull*0.60+bias.pBull*0.40):exec.pBull;
+      const synthBear=bias?Math.round(exec.pBear*0.60+bias.pBear*0.40):exec.pBear;
+      const synthSide=Math.max(0,100-synthBull-synthBear);
+      const synthDom=synthBull>synthBear&&synthBull>synthSide?"BULLISH":synthBear>synthBull&&synthBear>synthSide?"BEARISH":"SIDEWAYS";
+      const synthMax=Math.max(synthBull,synthBear,synthSide);
+      const synthConf=synthMax>70?"HIGH":synthMax>55?"MEDIUM":"LOW";
+      const synthConfColor=synthMax>70?"var(--neon)":synthMax>55?"var(--amber)":"var(--text-muted)";
+      const alignment=bias&&(exec.dominant===bias.dominant);
+      return{exec,bias,synth:{pBull:synthBull,pBear:synthBear,pSide:synthSide,dominant:synthDom,confLabel:synthConf,confColor:synthConfColor},alignment,alignmentLabel:alignment?"TF ALIGNED ✓":"TF CONFLICT ⚠",alignmentColor:alignment?"var(--neon)":"var(--red)"};
+    }catch(e){console.warn("MCMC error:",e.message);return null;}
+  }
+};
+
+// ============================================================
+// useINTEL hook
+// ============================================================
+function useINTEL(ohlcv,ohlcv1D,analysis,tf){
+  return useMemo(()=>{
+    if(!ohlcv||ohlcv.length<30) return null;
+    try{
+      const nash=NashEngine.analyze(ohlcv,analysis?.struct,analysis?.liq,analysis?.vol,analysis?.beh,analysis?.hqArr);
+      const mcmc=MCMCEngine.run(ohlcv,ohlcv1D,analysis?.vol,analysis?.hqArr,analysis?.struct,tf);
+      return{nash,mcmc};
+    }catch(e){console.warn("INTEL error:",e.message);return null;}
+  },[ohlcv,ohlcv1D,analysis,tf]);
+}
+
+// ============================================================
 function Dashboard({asset,data,loading}){
   const [tab,setTab]=useState("OVERVIEW");
   const [tf,setTf]=useState(TIMEFRAMES[3]); // default 1D
-  const TABS=["OVERVIEW","FRACTAL","STRUCTURE","BACKTEST","BEHAVIOR","V2 REGIME"];
+  const TABS=["OVERVIEW","FRACTAL","STRUCTURE","BACKTEST","BEHAVIOR","V2 REGIME","INTEL"];
   const analysis=useMFDFA(data?.ohlcv);
   const meta=data?.meta||{};
   const v2=useV2Analysis(data?.ohlcv,analysis?.hqArr,analysis?.struct,analysis?.liq,analysis?.vol);
+  const intel=useINTEL(data?.ohlcv,data?.ohlcv1D||data?.ohlcv,analysis,tf);
   const fmtP=p=>!p?"—":p<0.0001?p.toExponential(3):p<0.01?p.toFixed(8):p<1?p.toFixed(6):p.toFixed(2);
   const fmtV=v=>!v?"—":v>1e9?`$${(v/1e9).toFixed(2)}B`:v>1e6?`$${(v/1e6).toFixed(2)}M`:v>1e3?`$${(v/1e3).toFixed(1)}K`:`$${v.toFixed(0)}`;
 
@@ -1806,14 +2024,177 @@ function Dashboard({asset,data,loading}){
             </div>
           </>
         )}
+        {tab==="INTEL"&&(
+          <>
+            {!intel?(
+              <Panel><div style={{padding:"30px",textAlign:"center",fontSize:"10px",color:"var(--amber)",letterSpacing:"3px"}}>INSUFFICIENT DATA FOR INTEL ANALYSIS</div></Panel>
+            ):(
+              <>
+                {/* ── NASH BEHAVIOR ENGINE ── */}
+                {intel.nash&&(
+                  <Panel style={{marginBottom:"8px",borderColor:"var(--purple)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+                      <PanelLabel color="var(--purple)">◈ NASH BEHAVIOR ENGINE</PanelLabel>
+                      <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+                        <span style={{fontSize:"7px",color:"var(--text-muted)"}}>CONFIDENCE</span>
+                        <span style={{fontSize:"13px",fontWeight:800,color:intel.nash.confidence>70?"var(--neon)":intel.nash.confidence>50?"var(--amber)":"var(--text-muted)"}}>{intel.nash.confidence}%</span>
+                      </div>
+                    </div>
+                    {/* Top 3 cards */}
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"8px",marginBottom:"10px"}}>
+                      <div style={{padding:"12px",textAlign:"center",background:"var(--bg-deep)",border:`2px solid ${intel.nash.crowdColor}44`}}>
+                        <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"6px"}}>CROWD BIAS</div>
+                        <div style={{fontSize:"11px",fontWeight:800,color:intel.nash.crowdColor,letterSpacing:"2px"}}>{intel.nash.crowdBias}</div>
+                      </div>
+                      <div style={{padding:"12px",textAlign:"center",background:"var(--bg-deep)",border:`2px solid ${intel.nash.trapColor}44`}}>
+                        <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"6px"}}>TRAP RISK</div>
+                        <div style={{fontSize:"14px",fontWeight:800,color:intel.nash.trapColor}}>{intel.nash.trapRisk}</div>
+                      </div>
+                      <div style={{padding:"12px",textAlign:"center",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                        <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"6px"}}>COMPOSITE</div>
+                        <div style={{fontSize:"20px",fontWeight:800,color:intel.nash.composite>62?"var(--neon)":intel.nash.composite<38?"var(--red)":"var(--amber)"}}>{intel.nash.composite}</div>
+                      </div>
+                    </div>
+                    {/* MM Incentive */}
+                    <div style={{padding:"10px",background:"var(--purple-ghost,#7c3aed11)",border:"1px solid var(--purple)33",marginBottom:"10px"}}>
+                      <div style={{fontSize:"7px",color:"var(--purple)",letterSpacing:"3px",marginBottom:"4px"}}>MARKET MAKER INCENTIVE</div>
+                      <div style={{fontSize:"12px",fontWeight:800,color:"var(--purple)",letterSpacing:"2px",marginBottom:"4px"}}>{intel.nash.mmIncentive}</div>
+                      <div style={{fontSize:"8px",color:"var(--text-muted)",lineHeight:1.7}}>{intel.nash.mmDesc}</div>
+                    </div>
+                    {/* Weight breakdown */}
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"6px",marginBottom:"10px"}}>
+                      {[
+                        {label:"SMC/WICK",val:intel.nash.weights.smc,w:"35%",color:"var(--neon)"},
+                        {label:"VOL/LIQ",val:intel.nash.weights.vol,w:"30%",color:"var(--blue)"},
+                        {label:"TREND",val:intel.nash.weights.trend,w:"25%",color:"var(--amber)"},
+                        {label:"CONTEXT",val:intel.nash.weights.extra,w:"10%",color:"var(--purple)"},
+                      ].map(m=>(
+                        <div key={m.label} style={{padding:"6px",background:"var(--bg-deep)",border:"1px solid var(--border)",textAlign:"center"}}>
+                          <div style={{fontSize:"6px",color:"var(--text-muted)",letterSpacing:"1px"}}>{m.label} [{m.w}]</div>
+                          <div style={{fontSize:"16px",fontWeight:800,color:m.color,marginTop:"2px"}}>{m.val}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {/* Interpretation */}
+                    <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)",marginBottom:"10px"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"4px"}}>BEHAVIOR INTERPRETATION</div>
+                      <div style={{fontSize:"9px",color:"var(--text-primary)",lineHeight:1.8}}>{intel.nash.interpretation}</div>
+                    </div>
+                    {/* Action */}
+                    <div style={{padding:"12px",textAlign:"center",background:intel.nash.actionColor==="var(--red)"?"var(--red-ghost)":intel.nash.actionColor==="var(--neon)"?"var(--neon-ghost)":"var(--amber-ghost)",border:`1px solid ${intel.nash.actionColor}44`}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px",letterSpacing:"2px"}}>RECOMMENDED ACTION</div>
+                      <div style={{fontSize:"13px",fontWeight:800,color:intel.nash.actionColor,letterSpacing:"3px"}}>{intel.nash.action}</div>
+                    </div>
+                    {/* Extra metrics row */}
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"6px",marginTop:"8px"}}>
+                      <Metric label="PRICE POSITION" value={`${intel.nash.pricePosition}%`} color="var(--blue)"/>
+                      <Metric label="VOL RATIO" value={`${intel.nash.volRatio}×`} color="var(--amber)"/>
+                      <Metric label="UPPER WICK" value={`${intel.nash.wickData.upper}%`} color="var(--text-muted)"/>
+                    </div>
+                  </Panel>
+                )}
+
+                {/* ── MCMC SCENARIO ENGINE ── */}
+                {intel.mcmc&&(
+                  <Panel style={{marginBottom:"8px",borderColor:"var(--blue)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+                      <PanelLabel color="var(--blue)">⟳ MCMC SCENARIO ENGINE</PanelLabel>
+                      <Badge label={intel.mcmc.alignmentLabel} color={intel.mcmc.alignmentColor}/>
+                    </div>
+                    {/* Synthesized probabilities — big display */}
+                    <div style={{padding:"14px",background:"var(--bg-deep)",border:"1px solid var(--border-bright)",marginBottom:"10px"}}>
+                      <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"3px",textAlign:"center",marginBottom:"10px"}}>DUAL-TF SYNTHESIZED PROBABILITY [{tf?.label||"ACTIVE"} 60% + 1D 40%]</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"8px",textAlign:"center"}}>
+                        {[
+                          {label:"BULLISH",val:intel.mcmc.synth.pBull,color:"var(--neon)"},
+                          {label:"BEARISH",val:intel.mcmc.synth.pBear,color:"var(--red)"},
+                          {label:"SIDEWAYS",val:intel.mcmc.synth.pSide,color:"var(--amber)"},
+                        ].map(s=>(
+                          <div key={s.label} style={{padding:"14px",background:intel.mcmc.synth.dominant===s.label?`${s.color}11`:"transparent",border:`1px solid ${intel.mcmc.synth.dominant===s.label?s.color:"var(--border)"}44`}}>
+                            <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"6px"}}>{s.label}</div>
+                            <div style={{fontSize:"28px",fontWeight:800,color:s.color,textShadow:intel.mcmc.synth.dominant===s.label?`0 0 15px ${s.color}`:"none"}}>{s.val}%</div>
+                          </div>
+                        ))}
+                      </div>
+                      {/* Probability bar */}
+                      <div style={{display:"flex",height:"6px",marginTop:"10px",overflow:"hidden",borderRadius:"2px"}}>
+                        <div style={{width:`${intel.mcmc.synth.pBull}%`,background:"var(--neon)",transition:"width 0.5s"}}/>
+                        <div style={{width:`${intel.mcmc.synth.pSide}%`,background:"var(--amber)",transition:"width 0.5s"}}/>
+                        <div style={{width:`${intel.mcmc.synth.pBear}%`,background:"var(--red)",transition:"width 0.5s"}}/>
+                      </div>
+                      <div style={{display:"flex",justifyContent:"space-between",marginTop:"4px",fontSize:"7px",color:"var(--text-muted)"}}>
+                        <span>BULL {intel.mcmc.synth.pBull}%</span>
+                        <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+                          <span style={{color:intel.mcmc.synth.confColor,fontWeight:700}}>{intel.mcmc.synth.confLabel} CONFIDENCE</span>
+                        </div>
+                        <span>BEAR {intel.mcmc.synth.pBear}%</span>
+                      </div>
+                    </div>
+                    {/* Dual TF breakdown */}
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"10px"}}>
+                      {[intel.mcmc.exec, intel.mcmc.bias].filter(Boolean).map((sc,i)=>(
+                        <div key={i} style={{padding:"10px",background:"var(--bg-deep)",border:`1px solid ${sc.dominant==="BULLISH"?"var(--neon)":sc.dominant==="BEARISH"?"var(--red)":"var(--amber)"}33`}}>
+                          <div style={{fontSize:"7px",color:"var(--text-muted)",letterSpacing:"2px",marginBottom:"6px"}}>{sc.label} SCENARIO</div>
+                          <div style={{display:"flex",gap:"8px",justifyContent:"space-between",marginBottom:"6px"}}>
+                            <span style={{fontSize:"9px",color:"var(--neon)",fontWeight:700}}>B {sc.pBull}%</span>
+                            <span style={{fontSize:"9px",color:"var(--amber)",fontWeight:700}}>S {sc.pSide}%</span>
+                            <span style={{fontSize:"9px",color:"var(--red)",fontWeight:700}}>D {sc.pBear}%</span>
+                          </div>
+                          <div style={{fontSize:"8px",color:sc.dominant==="BULLISH"?"var(--neon)":sc.dominant==="BEARISH"?"var(--red)":"var(--amber)",fontWeight:700,letterSpacing:"2px",marginBottom:"4px"}}>{sc.dominant} [{sc.confLabel}]</div>
+                          <div style={{fontSize:"7px",color:"var(--text-muted)",lineHeight:1.6}}>{sc.explanation}</div>
+                          {sc.uncertainty!==undefined&&<div style={{marginTop:"4px",fontSize:"7px",color:"var(--text-muted)"}}>Uncertainty: {sc.uncertainty}%</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </Panel>
+                )}
+
+                {/* ── COMBINED DECISION SUMMARY ── */}
+                {intel.nash&&intel.mcmc&&(
+                  <Panel style={{borderColor:"var(--amber)"}}>
+                    <PanelLabel color="var(--amber)">⚡ COMBINED DECISION SUMMARY</PanelLabel>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"10px"}}>
+                      <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                        <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px",letterSpacing:"2px"}}>NASH VERDICT</div>
+                        <div style={{fontSize:"11px",fontWeight:800,color:intel.nash.actionColor,letterSpacing:"2px"}}>{intel.nash.action}</div>
+                        <div style={{fontSize:"8px",color:"var(--text-muted)",marginTop:"2px"}}>Trap Risk: {intel.nash.trapRisk}</div>
+                      </div>
+                      <div style={{padding:"10px",background:"var(--bg-deep)",border:"1px solid var(--border)"}}>
+                        <div style={{fontSize:"7px",color:"var(--text-muted)",marginBottom:"4px",letterSpacing:"2px"}}>MCMC DOMINANT</div>
+                        <div style={{fontSize:"11px",fontWeight:800,color:intel.mcmc.synth.confColor,letterSpacing:"2px"}}>{intel.mcmc.synth.dominant}</div>
+                        <div style={{fontSize:"8px",color:"var(--text-muted)",marginTop:"2px"}}>{intel.mcmc.alignmentLabel}</div>
+                      </div>
+                    </div>
+                    {/* Final verdict */}
+                    {(()=>{
+                      const nashBull=intel.nash.crowdBias==="LONG-BIASED";
+                      const nashBear=intel.nash.crowdBias==="SHORT-BIASED";
+                      const mcmcBull=intel.mcmc.synth.dominant==="BULLISH";
+                      const mcmcBear=intel.mcmc.synth.dominant==="BEARISH";
+                      const trapHigh=intel.nash.trapRisk==="HIGH";
+                      let verdict,verdictColor,verdictDesc;
+                      if(trapHigh){verdict="⛔ STAND ASIDE";verdictColor="var(--red)";verdictDesc="Nash detected high trap risk. MCMC may be unreliable. Protect capital.";}
+                      else if(nashBull&&mcmcBull&&intel.mcmc.alignment){verdict="🟢 HIGH CONVICTION LONG";verdictColor="var(--neon)";verdictDesc="Nash + MCMC aligned bullish across timeframes. Highest confluence setup.";}
+                      else if(nashBear&&mcmcBear&&intel.mcmc.alignment){verdict="🔴 HIGH CONVICTION SHORT";verdictColor="var(--red)";verdictDesc="Nash + MCMC aligned bearish across timeframes. Strong distribution signal.";}
+                      else if(!intel.mcmc.alignment){verdict="⚠ TIMEFRAME CONFLICT";verdictColor="var(--amber)";verdictDesc="Active TF and 1D bias are in disagreement. Reduce size or wait for alignment.";}
+                      else{verdict="◈ NEUTRAL — WAIT";verdictColor="var(--text-muted)";verdictDesc="Mixed signals between Nash and MCMC. No clear high-probability setup.";}
+                      return(
+                        <div style={{padding:"16px",textAlign:"center",background:verdictColor==="var(--neon)"?"var(--neon-ghost)":verdictColor==="var(--red)"?"var(--red-ghost)":"var(--amber-ghost)",border:`2px solid ${verdictColor}44`}}>
+                          <div style={{fontSize:"14px",fontWeight:800,color:verdictColor,letterSpacing:"3px",marginBottom:"6px"}}>{verdict}</div>
+                          <div style={{fontSize:"9px",color:"var(--text-muted)",lineHeight:1.7}}>{verdictDesc}</div>
+                        </div>
+                      );
+                    })()}
+                  </Panel>
+                )}
+              </>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
 }
-
-// ============================================================
-// ROOT APP
-// ============================================================
 export default function App() {
   const [watchlist,setWatchlist]=useState([
     {address:"0x6b175474e89094c44da98b954eedeac495271d0f",symbol:"DAI",name:"Dai Stablecoin",type:"evm",chain:"ethereum"},
